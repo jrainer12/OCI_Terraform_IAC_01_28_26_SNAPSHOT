@@ -1,0 +1,692 @@
+name: Deploy Prometheus
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Install or uninstall Prometheus and Grafana
+        required: true
+        default: install
+        type: choice
+        options: [install, uninstall]
+      include_prometheus:
+        description: Include Prometheus monitoring stack
+        required: false
+        default: true
+        type: boolean
+      include_grafana:
+        description: Include Grafana dashboard (requires Prometheus)
+        required: false
+        default: true
+        type: boolean
+      include_loki:
+        description: Include Loki logging stack (Promtail + Loki)
+        required: false
+        default: true
+        type: boolean
+      include_keda:
+        description: Include KEDA for event-driven autoscaling
+        required: false
+        default: true
+        type: boolean
+      enable_persistence:
+        description: Enable persistent storage for Prometheus/Grafana/Loki (uses ~150Gi block storage)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-prometheus
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_COMPARTMENT_OCID }}
+  # Namespaces to collect logs from (comma-separated)
+  LOKI_COLLECT_NAMESPACES: "rainercloud,nginx-gateway"
+
+jobs:
+  deploy-prometheus:
+    runs-on: ubuntu-latest
+    env:
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_PRIVATE_KEY_BASE64: ${{ secrets.OCI_PRIVATE_KEY_BASE64 }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_OBJECT_STORAGE_NAMESPACE: ${{ secrets.OCI_OBJECT_STORAGE_NAMESPACE }}
+      OCI_S3_ACCESS_KEY_ID: ${{ secrets.OCI_S3_ACCESS_KEY_ID }}
+      OCI_S3_SECRET_ACCESS_KEY: ${{ secrets.OCI_S3_SECRET_ACCESS_KEY }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout IaC repo
+        uses: actions/checkout@v4
+
+      - name: Terraform init & get cluster id
+        id: tf
+        uses: jrainer12/Reusable_GitHub_Actions/.github/actions/oci-terraform-init-oke@main
+        with:
+          backend_key: "oci-oke/terraform.tfstate"
+          terraform_version: "1.5.7"
+
+      - name: Validate cluster_id
+        run: |
+          set -euo pipefail
+          cid="${{ steps.tf.outputs.cluster_id }}"
+          if [ -z "$cid" ]; then
+            echo "❌ Error: cluster_id is empty from terraform output"
+            echo "Make sure the cluster has been deployed first using the main pipeline"
+            exit 1
+          fi
+          echo "Using cluster_id (suppressed from logs for security)"
+
+      - name: Setup OCI / OKE / kubectl / Helm
+        uses: jrainer12/Reusable_GitHub_Actions/.github/actions/oci-oke-setup@main
+        with:
+          cluster_ocid: ${{ steps.tf.outputs.cluster_id }}
+
+      # ===================== INSTALL / UPGRADE PATH =====================
+      - name: Create monitoring namespace
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Add Prometheus Community Helm repo
+        if: ${{ inputs.action == 'install' && inputs.include_prometheus }}
+        run: |
+          set -euo pipefail
+          echo "📦 Adding Prometheus Community Helm repository..."
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Deploy Prometheus Stack
+        if: ${{ inputs.action == 'install' && inputs.include_prometheus }}
+        run: |
+          set -euo pipefail
+          
+          PERSISTENCE_ENABLED="${{ inputs.enable_persistence }}"
+
+          COMMON_FLAGS=(
+            --namespace monitoring
+            --create-namespace
+            --set prometheus.prometheusSpec.retention=30d
+            --set prometheus.prometheusSpec.externalUrl=https://rainercloud.com/prometheus
+            --set prometheus.prometheusSpec.resources.requests.memory=1Gi
+            --set prometheus.prometheusSpec.resources.requests.cpu=500m
+            --set prometheus.prometheusSpec.resources.limits.memory=2Gi
+            --set prometheus.prometheusSpec.resources.limits.cpu=1000m
+          )
+          
+          # Add Prometheus storage only when persistence is enabled
+          if [ "${PERSISTENCE_ENABLED}" == "true" ]; then
+            echo "Persistence enabled - Prometheus will use 20Gi PVC"
+            COMMON_FLAGS+=(
+              --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=20Gi
+            )
+          else
+            echo "Persistence disabled - Prometheus will use emptyDir (data lost on restart)"
+          fi
+
+          if [ "${{ inputs.include_grafana }}" == "true" ]; then
+            echo "Including Grafana..."
+            GRAFANA_FLAGS=(
+                --set grafana.enabled=true
+                --set grafana.persistence.enabled=${PERSISTENCE_ENABLED}
+                --set grafana.persistence.size=10Gi
+              
+                --set grafana.deployment.terminationGracePeriodSeconds=60
+                --set grafana.resources.requests.memory=512Mi
+                --set grafana.resources.requests.cpu=200m
+                --set grafana.resources.limits.memory=1Gi
+                --set grafana.resources.limits.cpu=1000m
+                --set grafana.livenessProbe.timeoutSeconds=5
+                --set grafana.livenessProbe.initialDelaySeconds=60
+                --set grafana.readinessProbe.timeoutSeconds=5
+                --set grafana.readinessProbe.initialDelaySeconds=30
+                --set grafana.containerSecurityContext.allowPrivilegeEscalation=false
+                --set grafana.containerSecurityContext.readOnlyRootFilesystem=false
+              
+                --set grafana.grafana\\.ini.server.domain=rainercloud.com
+                --set grafana.grafana\\.ini.server.root_url=https://rainercloud.com/grafana/
+                --set grafana.grafana\\.ini.server.serve_from_sub_path=true
+                --set grafana.grafana\\.ini.server.protocol=http
+                --set grafana.grafana\\.ini.server.enforce_domain=false
+              
+                --set grafana.grafana\\.ini.security.allow_embedding=true
+              
+                --set grafana.sidecar.datasources.enabled=true
+                --set grafana.sidecar.datasources.label=grafana_datasource
+                --set grafana.sidecar.datasources.reloadURL=http://localhost:3000/api/admin/provisioning/datasources/reload
+                --set grafana.sidecar.datasources.watch=true
+                --set grafana.sidecar.datasources.skipReload=false
+                --set grafana.sidecar.alerts.enabled=true
+                --set grafana.sidecar.alerts.label=grafana_alert
+                --set grafana.sidecar.alerts.watch=true
+                --set grafana.sidecar.alerts.skipReload=false
+                --set grafana.sidecar.alerts.reloadURL=http://localhost:3000/api/admin/provisioning/alerting/reload
+                --set grafana.deployment.extraVolumes[0].name=alerting-config
+                --set grafana.deployment.extraVolumes[0].projected.sources[0].configMap.name=grafana-alerting-contactpoints
+                --set grafana.deployment.extraVolumes[0].projected.sources[1].configMap.name=grafana-alerting-rules
+                --set grafana.deployment.extraVolumeMounts[0].name=alerting-config
+                --set grafana.deployment.extraVolumeMounts[0].mountPath=/etc/grafana/provisioning/alerting
+                --set grafana.deployment.extraVolumeMounts[0].readOnly=true
+                --set grafana.deployment.lifecycle.postStart.exec.command[0]=/bin/sh
+                --set grafana.deployment.lifecycle.postStart.exec.command[1]=-c
+                --set 'grafana.deployment.lifecycle.postStart.exec.command[2]=sleep 15 && for i in $(seq 1 30); do if command -v curl > /dev/null 2>&1; then if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then curl -X POST http://localhost:3000/api/admin/provisioning/datasources/reload || true; curl -X POST http://localhost:3000/api/admin/provisioning/alerting/reload || true; break; fi; elif wget -qO- http://localhost:3000/api/health > /dev/null 2>&1; then wget --method=POST -qO- http://localhost:3000/api/admin/provisioning/datasources/reload || true; wget --method=POST -qO- http://localhost:3000/api/admin/provisioning/alerting/reload || true; break; fi; sleep 2; done'
+              )
+            
+            # Load Telegram credentials from K8s secret into Grafana env
+            GRAFANA_FLAGS+=( --set 'grafana.envFromSecret=grafana-telegram-secret' )
+          else
+            echo "Grafana disabled..."
+            GRAFANA_FLAGS=( --set grafana.enabled=false )
+          fi
+
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            "${COMMON_FLAGS[@]}" \
+            "${GRAFANA_FLAGS[@]}"
+
+      - name: Wait for Prometheus (and Grafana) to be ready
+        if: ${{ inputs.action == 'install' && inputs.include_prometheus }}
+        run: |
+          set -euo pipefail
+          echo "⏳ Waiting for Prometheus components to be ready..."
+
+          echo "Current pods in monitoring namespace:"
+          kubectl get pods -n monitoring || true
+
+          echo ""
+          echo "Waiting for Prometheus Operator..."
+          kubectl wait --timeout=10m -n monitoring \
+            deployment -l app.kubernetes.io/name=kube-prometheus-stack-operator \
+            --for=condition=Available || true
+
+          echo ""
+          echo "Polling Prometheus/Grafana readiness..."
+          sleep 5
+
+          for i in {1..60}; do
+            PROM_POD_LINE="$(kubectl get pods -n monitoring --no-headers 2>/dev/null | grep 'prometheus-prometheus-kube-prometheus-prometheus' | head -1 || true)"
+            PROM_OK=false
+            if [ -n "$PROM_POD_LINE" ]; then
+              PROM_STATUS="$(echo "$PROM_POD_LINE" | awk '{print $3}')"
+              READY_STR="$(echo "$PROM_POD_LINE" | awk '{print $2}')"
+              READY_COUNT="$(echo "$READY_STR" | cut -d'/' -f1)"
+              TOTAL_COUNT="$(echo "$READY_STR" | cut -d'/' -f2)"
+              if [ "$PROM_STATUS" = "Running" ] && [ "$READY_COUNT" = "$TOTAL_COUNT" ] && [ "$TOTAL_COUNT" != "0" ]; then
+                PROM_OK=true
+              fi
+            else
+              PROM_STATUS="Missing"
+              READY_COUNT="0"
+              TOTAL_COUNT="0"
+            fi
+
+            GRAFANA_OK=false
+            GRAFANA_STATUS="Disabled"
+            G_READY="0"
+            G_TOTAL="0"
+
+            if [ "${{ inputs.include_grafana }}" != "true" ]; then
+              GRAFANA_OK=true
+            else
+              GRAFANA_POD_LINE="$(kubectl get pods -n monitoring -l app.kubernetes.io/name=grafana --no-headers 2>/dev/null | head -1 || true)"
+              if [ -n "$GRAFANA_POD_LINE" ]; then
+                GRAFANA_STATUS="$(echo "$GRAFANA_POD_LINE" | awk '{print $3}')"
+                READY_STR="$(echo "$GRAFANA_POD_LINE" | awk '{print $2}')"
+                G_READY="$(echo "$READY_STR" | cut -d'/' -f1)"
+                G_TOTAL="$(echo "$READY_STR" | cut -d'/' -f2)"
+                if [ "$GRAFANA_STATUS" = "Running" ] && [ "$G_READY" = "$G_TOTAL" ] && [ "$G_TOTAL" != "0" ]; then
+                  GRAFANA_OK=true
+                fi
+              else
+                GRAFANA_STATUS="Missing"
+              fi
+            fi
+
+            if [ "$PROM_OK" = "true" ] && [ "$GRAFANA_OK" = "true" ]; then
+              echo "✅ All components are ready!"
+              break
+            fi
+
+            echo "Waiting... Prometheus: ${PROM_STATUS} (${READY_COUNT}/${TOTAL_COUNT}), Grafana: ${GRAFANA_STATUS} (${G_READY}/${G_TOTAL}) (attempt $i/60)"
+            sleep 10
+          done
+
+          echo ""
+          echo "Final pod status:"
+          kubectl get pods -n monitoring
+
+      - name: Verify Grafana configuration
+        if: ${{ inputs.action == 'install' && inputs.include_prometheus && inputs.include_grafana }}
+        run: |
+         set -euo pipefail
+         echo "🔍 Verifying Grafana configuration in grafana.ini..."
+         echo ""
+         echo "Checking Grafana ConfigMap:"
+         kubectl get configmap -n monitoring -l app.kubernetes.io/name=grafana -o yaml | grep -A 10 "root_url\|serve_from_sub_path\|domain" || echo "ConfigMap check completed"
+         echo ""
+         echo "Checking Grafana pod /etc/grafana/grafana.ini:"
+         kubectl exec -n monitoring deploy/prometheus-grafana -c grafana -- \
+           sh -lc 'grep -E "^domain|^root_url|^serve_from_sub_path" /etc/grafana/grafana.ini 2>/dev/null || echo "Config file check completed"'
+
+      - name: Add Grafana Helm repo (for Loki)
+        if: ${{ inputs.action == 'install' && inputs.include_loki }}
+        run: |
+          set -euo pipefail
+          echo "📦 Adding Grafana Helm repository for Loki..."
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+      - name: Deploy Loki
+        if: ${{ inputs.action == 'install' && inputs.include_loki }}
+        run: |
+          set -euo pipefail
+          echo "📦 Installing/upgrading Loki for log aggregation..."
+          
+          PERSISTENCE_ENABLED="${{ inputs.enable_persistence }}"
+          
+          # Build Loki Helm flags
+          LOKI_FLAGS=(
+            --namespace monitoring
+            --values k8s/prometheus/loki-values.yaml
+            --set singleBinary.persistence.enabled=${PERSISTENCE_ENABLED}
+            --set singleBinary.persistence.size=5Gi
+          )
+          
+          # When persistence is disabled, add emptyDir for /var/loki
+          if [ "${PERSISTENCE_ENABLED}" != "true" ]; then
+            echo "Persistence disabled - adding emptyDir volume for /var/loki"
+            LOKI_FLAGS+=(
+              --set 'singleBinary.extraVolumes[0].name=data'
+              --set 'singleBinary.extraVolumes[0].emptyDir.medium='
+              --set 'singleBinary.extraVolumeMounts[0].name=data'
+              --set 'singleBinary.extraVolumeMounts[0].mountPath=/var/loki'
+            )
+          fi
+          
+          helm upgrade --install loki grafana/loki "${LOKI_FLAGS[@]}"
+
+      - name: Apply Prometheus datasource ConfigMap for Grafana
+        if: ${{ inputs.action == 'install' && inputs.include_prometheus && inputs.include_grafana }}
+        run: |
+          set -euo pipefail
+          echo "📜 Applying Prometheus datasource ConfigMap for Grafana..."
+          kubectl apply -f k8s/prometheus/grafana-prometheus-datasource.yaml
+          echo "✅ Prometheus datasource ConfigMap applied"
+
+      - name: Apply Loki datasource ConfigMap for Grafana
+        if: ${{ inputs.action == 'install' && inputs.include_loki && inputs.include_grafana }}
+        run: |
+          set -euo pipefail
+          echo "📜 Applying Loki datasource ConfigMap for Grafana..."
+          kubectl apply -f k8s/prometheus/grafana-loki-datasource.yaml
+          echo "✅ Loki datasource ConfigMap applied"
+
+      - name: Apply Telegram contact point for Grafana Alerting
+        if: ${{ inputs.action == 'install' && inputs.include_grafana }}
+        run: |
+          set -euo pipefail
+          echo "📱 Configuring Telegram contact point for Grafana Alerting..."
+          
+          # Check if the K8s secret exists
+          if ! kubectl get secret grafana-telegram-secret -n monitoring >/dev/null 2>&1; then
+            echo "⚠️ K8s secret 'grafana-telegram-secret' not found - creating placeholder"
+            echo "   To configure Telegram, create the secret with both bot token and chat ID:"
+            echo "   kubectl create secret generic grafana-telegram-secret \\"
+            echo "     --from-literal=TELEGRAM_BOT_TOKEN=YOUR_TOKEN \\"
+            echo "     --from-literal=TELEGRAM_CHAT_ID=YOUR_CHAT_ID \\"
+            echo "     -n monitoring"
+            kubectl create secret generic grafana-telegram-secret \
+              --from-literal=TELEGRAM_BOT_TOKEN=PLACEHOLDER_TOKEN_REPLACE_ME \
+              --from-literal=TELEGRAM_CHAT_ID=PLACEHOLDER_CHAT_ID_REPLACE_ME \
+              -n monitoring --dry-run=client -o yaml | kubectl apply -f -
+            echo "   ⚠️  Remember to update the secret with your actual values!"
+            echo "   Skipping ConfigMap creation until secret is configured."
+            exit 0
+          fi
+          
+          # Get chat ID and bot token from secret
+          TELEGRAM_CHAT_ID=$(kubectl get secret grafana-telegram-secret -n monitoring -o jsonpath='{.data.TELEGRAM_CHAT_ID}' | base64 -d)
+          TELEGRAM_BOT_TOKEN=$(kubectl get secret grafana-telegram-secret -n monitoring -o jsonpath='{.data.TELEGRAM_BOT_TOKEN}' | base64 -d)
+          
+          if [ -z "$TELEGRAM_CHAT_ID" ] || [ "$TELEGRAM_CHAT_ID" = "PLACEHOLDER_CHAT_ID_REPLACE_ME" ]; then
+            echo "⚠️  Telegram chat ID not configured in secret 'grafana-telegram-secret'"
+            echo "   Update the secret with: kubectl create secret generic grafana-telegram-secret \\"
+            echo "     --from-literal=TELEGRAM_BOT_TOKEN=YOUR_TOKEN \\"
+            echo "     --from-literal=TELEGRAM_CHAT_ID=YOUR_CHAT_ID \\"
+            echo "     -n monitoring --dry-run=client -o yaml | kubectl apply -f -"
+            echo "   Skipping ConfigMap creation."
+            exit 0
+          fi
+          
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ "$TELEGRAM_BOT_TOKEN" = "PLACEHOLDER_TOKEN_REPLACE_ME" ]; then
+            echo "⚠️  Telegram bot token not configured in secret 'grafana-telegram-secret'"
+            echo "   Update the secret with: kubectl create secret generic grafana-telegram-secret \\"
+            echo "     --from-literal=TELEGRAM_BOT_TOKEN=YOUR_TOKEN \\"
+            echo "     --from-literal=TELEGRAM_CHAT_ID=YOUR_CHAT_ID \\"
+            echo "     -n monitoring --dry-run=client -o yaml | kubectl apply -f -"
+            echo "   Skipping ConfigMap creation."
+            exit 0
+          fi
+          
+          echo "✅ K8s secret 'grafana-telegram-secret' found"
+          echo "Creating Telegram contact point ConfigMap..."
+          # Substitute both chat ID and bot token placeholders
+          template_content="$(cat k8s/prometheus/grafana-alerting-contactpoints.yaml.template)"
+          template_content="${template_content//TELEGRAM_CHAT_ID_PLACEHOLDER/${TELEGRAM_CHAT_ID}}"
+          template_content="${template_content//'${TELEGRAM_BOT_TOKEN}'/${TELEGRAM_BOT_TOKEN}}"
+          printf '%s\n' "$template_content" > /tmp/grafana-alerting-contactpoints.yaml
+          
+          kubectl apply -f /tmp/grafana-alerting-contactpoints.yaml
+          rm -f /tmp/grafana-alerting-contactpoints.yaml
+          
+          echo "✅ Telegram contact point ConfigMap created"
+          echo "   Name: Josef"
+          echo "   Chat ID: ${TELEGRAM_CHAT_ID}"
+          echo "   Bot token: loaded from K8s secret 'grafana-telegram-secret'"
+          echo ""
+          echo "⚠️  IMPORTANT: The Grafana sidecar for alerts expects Alertmanager config format."
+          echo "   For unified alerting, the ConfigMap needs to be mounted at:"
+          echo "   /etc/grafana/provisioning/alerting/contactpoints.yaml"
+          echo ""
+          echo "   The ConfigMap is created, but you may need to manually create the contact point"
+          echo "   via API if it doesn't appear automatically. Check Grafana logs for errors."
+
+      - name: Apply Grafana alerting rules
+        if: ${{ inputs.action == 'install' && inputs.include_grafana }}
+        run: |
+          set -euo pipefail
+          echo "📟 Applying Grafana alerting rules and policies..."
+          kubectl apply -f k8s/prometheus/grafana-alerting-rules.yaml
+          echo "✅ Grafana alerting rules ConfigMap applied"
+
+      - name: Deploy Grafana Alloy
+        if: ${{ inputs.action == 'install' && inputs.include_loki }}
+        run: |
+          set -euo pipefail
+          echo "📦 Installing Grafana Alloy for log collection..."
+          echo "Note: Grafana Agent reached EOL; Alloy is the recommended replacement"
+          
+          # Parse namespaces from env variable
+          NAMESPACES="${{ env.LOKI_COLLECT_NAMESPACES }}"
+          echo "Collecting logs from namespaces: $NAMESPACES"
+          
+          # Convert comma-separated list to array and build namespace list for Alloy config
+          NS_LIST=""
+          IFS=',' read -ra NS_ARRAY <<< "$NAMESPACES"
+          for ns in "${NS_ARRAY[@]}"; do
+            ns=$(echo "$ns" | xargs)  # trim whitespace
+            if [ -n "$ns" ]; then
+              if [ -z "$NS_LIST" ]; then
+                NS_LIST="\"${ns}\""
+              else
+                NS_LIST="${NS_LIST}, \"${ns}\""
+              fi
+            fi
+          done
+          
+          # Copy template and replace namespace placeholder
+          cp k8s/prometheus/alloy-config.river.template /tmp/alloy-config.river
+          sed -i "s/NAMESPACE_PLACEHOLDER/${NS_LIST}/g" /tmp/alloy-config.river
+          
+          echo "Rendered Alloy config:"
+          echo "--------------------------------"
+          cat /tmp/alloy-config.river
+          echo "--------------------------------"
+          
+          # Delete existing ConfigMap to avoid ownership conflicts
+          echo "Cleaning up existing ConfigMap (will recreate with Helm ownership)..."
+          kubectl delete configmap grafana-alloy-config -n monitoring --ignore-not-found=true || true
+          
+          # Create ConfigMap with Helm ownership labels BEFORE Helm install
+          echo "Creating ConfigMap with Helm ownership labels..."
+          kubectl create configmap grafana-alloy-config \
+            --from-file=config.river=/tmp/alloy-config.river \
+            --namespace monitoring \
+            --dry-run=client -o yaml | \
+          kubectl label --local -f - \
+            app.kubernetes.io/managed-by=Helm \
+            -o yaml | \
+          kubectl annotate --local -f - \
+            meta.helm.sh/release-name=grafana-alloy \
+            meta.helm.sh/release-namespace=monitoring \
+            -o yaml | \
+          kubectl apply -f -
+          
+          # Deploy Grafana Alloy using Helm (will reference the existing ConfigMap)
+          echo "Installing/upgrading Grafana Alloy..."
+          helm repo update
+          
+          helm upgrade --install grafana-alloy grafana/alloy \
+            --namespace monitoring \
+            --set alloy.configMap.create=false \
+            --set alloy.configMap.name=grafana-alloy-config \
+            --set alloy.configMap.key=config.river \
+            --set controller.type=daemonset \
+            --set resources.requests.memory=256Mi \
+            --set resources.requests.cpu=100m \
+            --set resources.limits.memory=512Mi \
+            --set resources.limits.cpu=500m
+
+          rm -f /tmp/alloy-config.river
+
+      - name: Wait for Loki and Grafana Alloy to be ready
+        if: ${{ inputs.action == 'install' && inputs.include_loki }}
+        run: |
+          set -euo pipefail
+          echo "⏳ Waiting for Loki and Grafana Alloy to be ready..."
+          
+          # Loki installs as a StatefulSet in SingleBinary mode (recommended for this repo)
+          if kubectl get statefulset -n monitoring loki 2>/dev/null | grep -q .; then
+            kubectl rollout status -n monitoring statefulset/loki --timeout=5m || echo "Loki rollout wait completed"
+          elif kubectl get deployment -n monitoring loki 2>/dev/null | grep -q .; then
+            kubectl rollout status -n monitoring deployment/loki --timeout=5m || echo "Loki rollout wait completed"
+          fi
+          
+          if kubectl get daemonset -n monitoring grafana-alloy 2>/dev/null | grep -q .; then
+            kubectl rollout status -n monitoring daemonset/grafana-alloy --timeout=5m || echo "Grafana Alloy rollout wait completed"
+          fi
+          
+          echo ""
+          echo "Loki and Grafana Alloy pods:"
+          kubectl get pods -n monitoring -l app.kubernetes.io/name=loki || true
+          # Alloy chart label conventions vary; query by instance and by name.
+          kubectl get pods -n monitoring -l app.kubernetes.io/instance=grafana-alloy || true
+          kubectl get pods -n monitoring -l app.kubernetes.io/name=alloy || true
+
+          echo ""
+          echo "Grafana Alloy diagnostics:"
+          kubectl get daemonset -n monitoring grafana-alloy -o wide || true
+          kubectl describe daemonset -n monitoring grafana-alloy || true
+          kubectl get events -n monitoring --sort-by=.lastTimestamp | tail -n 80 || true
+
+      # ===================== KEDA (Event-Driven Autoscaling) =====================
+      - name: Deploy KEDA
+        if: ${{ inputs.action == 'install' && inputs.include_keda }}
+        run: |
+          set -euo pipefail
+          echo "📦 Adding KEDA Helm repository..."
+          helm repo add kedacore https://kedacore.github.io/charts
+          helm repo update
+          
+          echo "📦 Installing/upgrading KEDA in monitoring namespace..."
+          helm upgrade --install keda kedacore/keda \
+            --namespace monitoring \
+            --set resources.operator.requests.memory=128Mi \
+            --set resources.operator.requests.cpu=50m \
+            --set resources.operator.limits.memory=256Mi \
+            --set resources.operator.limits.cpu=200m \
+            --set resources.metricServer.requests.memory=128Mi \
+            --set resources.metricServer.requests.cpu=50m \
+            --set resources.metricServer.limits.memory=256Mi \
+            --set resources.metricServer.limits.cpu=200m
+
+      - name: Wait for KEDA to be ready
+        if: ${{ inputs.action == 'install' && inputs.include_keda }}
+        run: |
+          set -euo pipefail
+          echo "⏳ Waiting for KEDA to be ready..."
+          
+          kubectl rollout status -n monitoring deployment/keda-operator --timeout=3m || echo "KEDA operator rollout wait completed"
+          kubectl rollout status -n monitoring deployment/keda-operator-metrics-apiserver --timeout=3m || echo "KEDA metrics server rollout wait completed"
+          
+          echo ""
+          echo "KEDA pods:"
+          kubectl get pods -n monitoring -l app=keda-operator
+          
+          echo ""
+          echo "KEDA CRDs installed:"
+          kubectl get crd | grep keda || echo "No KEDA CRDs found"
+
+      - name: Apply Grafana HTTPRoute for Gateway API access
+        if: ${{ inputs.action == 'install' && inputs.include_prometheus && inputs.include_grafana }}
+        run: |
+          set -euo pipefail
+          echo "📜 Applying SnippetsFilter for Grafana Location header rewriting..."
+          kubectl apply -f k8s/prometheus/grafana-snippetsfilter.yaml
+          echo ""
+          echo "📜 Applying HTTPRoute for Grafana..."
+          kubectl apply -f k8s/prometheus/grafana-route.yaml
+          echo ""
+          echo "SnippetsFilters:"
+          kubectl get snippetsfilters -n monitoring
+          echo ""
+          echo "HTTPRoutes:"
+          kubectl get httproutes -n monitoring
+
+      - name: Display access info
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+
+          echo ""
+          echo "✅ Monitoring stack deployed successfully!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          GATEWAY_IP=$(kubectl get gateway public-gateway -n nginx-gateway -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || echo "")
+          
+          if [ "${{ inputs.include_prometheus }}" == "true" ]; then
+            if [ "${{ inputs.include_grafana }}" == "true" ]; then
+              echo "🌐 Grafana: https://rainercloud.com/grafana/"
+              [ -n "$GATEWAY_IP" ] && echo "Gateway IP: $GATEWAY_IP"
+              echo ""
+              echo "⚠️  Prometheus is NOT exposed via gateway (recommended). Use port-forward."
+            fi
+
+            PROM_SVC="prometheus-kube-prometheus-prometheus"
+            echo ""
+            echo "📡 Prometheus (port-forward):"
+            echo "  kubectl port-forward -n monitoring svc/${PROM_SVC} 9090:9090"
+            echo "  http://localhost:9090"
+            if [ "${{ inputs.enable_persistence }}" == "true" ]; then
+              echo "  Storage: 20Gi persistent volume"
+            else
+              echo "  Storage: ephemeral - metrics reset on pod restart"
+            fi
+
+            if [ "${{ inputs.include_grafana }}" == "true" ]; then
+              GRAFANA_SVC="prometheus-grafana"
+              echo ""
+              echo "📊 Grafana (port-forward):"
+              echo "  kubectl port-forward -n monitoring svc/${GRAFANA_SVC} 3000:80"
+              echo "  http://localhost:3000"
+              if [ "${{ inputs.enable_persistence }}" == "true" ]; then
+                echo "  Storage: 10Gi persistent volume"
+              else
+                echo "  Storage: ephemeral - dashboards reset on pod restart"
+              fi
+              echo ""
+            fi
+          fi
+
+          if [ "${{ inputs.include_loki }}" == "true" ]; then
+            echo ""
+            echo "📋 Loki (port-forward):"
+            echo "  kubectl port-forward -n monitoring svc/loki 3100:3100"
+            echo "  http://localhost:3100"
+            echo ""
+            echo "Log collection namespaces: ${{ env.LOKI_COLLECT_NAMESPACES }}"
+            echo "Retention: 48 hours (2 days)"
+            if [ "${{ inputs.enable_persistence }}" == "true" ]; then
+              echo "Storage: 5Gi persistent volume"
+            else
+              echo "Storage: ephemeral (emptyDir) - data lost on pod restart"
+            fi
+            echo "Log collector: Grafana Alloy (DaemonSet)"
+          fi
+
+          if [ "${{ inputs.include_keda }}" == "true" ]; then
+            echo ""
+            echo "⚡ KEDA (Event-Driven Autoscaling):"
+            echo "  Namespace: monitoring"
+            echo "  CRDs: ScaledObject, ScaledJob, TriggerAuthentication"
+            echo ""
+            echo "Example ScaledObject for your deployments:"
+            echo "  apiVersion: keda.sh/v1alpha1"
+            echo "  kind: ScaledObject"
+            echo "  metadata:"
+            echo "    name: my-scaledobject"
+            echo "  spec:"
+            echo "    scaleTargetRef:"
+            echo "      name: my-deployment"
+            echo "    triggers:"
+            echo "      - type: prometheus"
+            echo "        metadata:"
+            echo "          serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring:9090"
+            echo "          query: sum(rate(http_requests_total[2m]))"
+            echo "          threshold: '100'"
+          fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      # ===================== UNINSTALL PATH =====================
+      - name: Uninstall Prometheus Stack
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "🧹 Uninstalling Prometheus Stack Helm release..."
+          helm uninstall prometheus -n monitoring || echo "Helm release not found, may already be uninstalled"
+
+      - name: Delete Grafana HTTPRoute
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "🧹 Deleting Grafana HTTPRoute and SnippetsFilter (if they exist)..."
+          kubectl delete -f k8s/prometheus/grafana-route.yaml --ignore-not-found=true || true
+          kubectl delete -f k8s/prometheus/grafana-snippetsfilter.yaml --ignore-not-found=true || true
+
+      - name: Uninstall Loki and Grafana Alloy
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "🧹 Uninstalling Loki and Grafana Alloy Helm releases..."
+          helm uninstall loki -n monitoring --ignore-not-found=true || echo "Loki not found"
+          helm uninstall grafana-alloy -n monitoring --ignore-not-found=true || echo "Grafana Alloy not found"
+          kubectl delete configmap grafana-alloy-config -n monitoring --ignore-not-found=true || true
+          kubectl delete -f k8s/prometheus/grafana-prometheus-datasource.yaml --ignore-not-found=true || true
+          kubectl delete -f k8s/prometheus/grafana-loki-datasource.yaml --ignore-not-found=true || true
+          kubectl delete configmap grafana-alerting-contactpoints -n monitoring --ignore-not-found=true || true
+
+      - name: Uninstall KEDA
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "🧹 Uninstalling KEDA..."
+          helm uninstall keda -n monitoring || echo "KEDA not found"
+
+      - name: Delete monitoring namespace
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "Deleting monitoring namespace..."
+          kubectl delete namespace monitoring --ignore-not-found=true || true
+          echo "✅ Prometheus Stack uninstalled"

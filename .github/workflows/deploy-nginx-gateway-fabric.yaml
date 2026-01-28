@@ -1,0 +1,334 @@
+name: Deploy NGINX Gateway Fabric
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Install or uninstall NGINX Gateway Fabric and shared Gateway
+        required: true
+        default: install
+        type: choice
+        options: [install, uninstall]
+      service_mode:
+        description: |
+          Service exposure mode:
+          - LoadBalancer: Uses OCI Network Load Balancer (~$0.50/day)
+          - CloudflareTunnel: Uses Cloudflare Tunnel (free, more reliable)
+        required: true
+        default: CloudflareTunnel
+        type: choice
+        options: [LoadBalancer, CloudflareTunnel]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-nginx-gateway-fabric
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_COMPARTMENT_OCID }}
+  # Cloudflare Tunnel configuration
+  TUNNEL_NAME: "nginx-gateway-tunnel"
+
+jobs:
+  deploy-ngf:
+    runs-on: ubuntu-latest
+    env:
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_PRIVATE_KEY_BASE64: ${{ secrets.OCI_PRIVATE_KEY_BASE64 }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_OBJECT_STORAGE_NAMESPACE: ${{ secrets.OCI_OBJECT_STORAGE_NAMESPACE }}
+      OCI_S3_ACCESS_KEY_ID: ${{ secrets.OCI_S3_ACCESS_KEY_ID }}
+      OCI_S3_SECRET_ACCESS_KEY: ${{ secrets.OCI_S3_SECRET_ACCESS_KEY }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout IaC repo
+        uses: actions/checkout@v4
+
+      - name: Terraform init & get cluster id
+        id: tf
+        uses: jrainer12/Reusable_GitHub_Actions/.github/actions/oci-terraform-init-oke@main
+        with:
+          backend_key: "oci-oke/terraform.tfstate"
+          terraform_version: "1.5.7"
+
+      - name: Validate cluster_id
+        run: |
+          set -euo pipefail
+          cid="${{ steps.tf.outputs.cluster_id }}"
+          if [ -z "$cid" ]; then
+            echo "❌ Error: cluster_id is empty from terraform output"
+            echo "Make sure the cluster has been deployed first using the main pipeline"
+            exit 1
+          fi
+          echo "Using cluster_id=$cid"
+
+      - name: Setup OCI / OKE / kubectl / Helm
+        uses: jrainer12/Reusable_GitHub_Actions/.github/actions/oci-oke-setup@main
+        with:
+          cluster_ocid: ${{ steps.tf.outputs.cluster_id }}
+
+      # ===================== INSTALL PATH =====================
+      - name: Ensure Gateway API CRDs (standard channel)
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          echo "📦 Ensuring Gateway API CRDs (standard v1.4.0)..."
+          kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
+
+      - name: Install or upgrade NGINX Gateway Fabric
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          echo "📦 Installing / upgrading NGINX Gateway Fabric..."
+          echo "Service mode: ${{ inputs.service_mode }}"
+          
+          # Build Helm flags based on service mode
+          HELM_FLAGS=(
+            --namespace nginx-gateway
+            --create-namespace
+            --set nginxGateway.snippetsFilters.enable=true
+          )
+          
+          if [ "${{ inputs.service_mode }}" = "LoadBalancer" ]; then
+            echo "☁️ Using LoadBalancer mode (OCI Network Load Balancer)..."
+            # Remove NginxProxy config if switching from CloudflareTunnel to LoadBalancer
+            echo "Removing any existing NginxProxy configuration..."
+            kubectl delete -f k8s/gateway/nginx-proxy-clusterip.yaml --ignore-not-found=true || true
+            kubectl patch gatewayclass nginx --type=json \
+              -p='[{"op": "remove", "path": "/spec/parametersRef"}]' 2>/dev/null || true
+          else
+            echo "🌐 Using ClusterIP mode for Cloudflare Tunnel..."
+          fi
+          
+          helm upgrade --install nginx-gateway oci://ghcr.io/nginx/charts/nginx-gateway-fabric \
+            "${HELM_FLAGS[@]}"
+
+          echo "⏳ Waiting for NGINX Gateway Fabric deployment to be ready..."
+          kubectl wait --timeout=5m -n nginx-gateway \
+            deployment -l app.kubernetes.io/name=nginx-gateway-fabric \
+            --for=condition=Available
+
+      - name: Apply TLS Certificate for rainercloud.com
+        if: ${{ inputs.action == 'install' && inputs.service_mode == 'LoadBalancer' }}
+        run: |
+          set -euo pipefail
+          echo "📜 Applying Certificate for rainercloud.com..."
+          kubectl apply -f k8s/gateway/rainercloud-certificate.yaml
+
+          echo
+          echo "Current Certificates in nginx-gateway:"
+          kubectl get certificate -n nginx-gateway || true
+
+      - name: Deploy Cloudflare Tunnel
+        if: ${{ inputs.action == 'install' && inputs.service_mode == 'CloudflareTunnel' }}
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "🚇 Deploying Cloudflare Tunnel via Helm..."
+          
+          # Validate tunnel token is set
+          if [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "❌ Error: CLOUDFLARE_TUNNEL_TOKEN secret is not set!"
+            echo ""
+            echo "To set up Cloudflare Tunnel:"
+            echo "1. Go to Cloudflare Dashboard → Zero Trust → Networks → Tunnels"
+            echo "2. Click 'Create a tunnel' → Select 'Cloudflared'"
+            echo "3. Name it (e.g., 'nginx-gateway-tunnel')"
+            echo "4. Copy the tunnel token"
+            echo "5. Add it as GitHub secret: CLOUDFLARE_TUNNEL_TOKEN"
+            echo ""
+            echo "6. Configure the tunnel's Public Hostname:"
+            echo "   - Domain: rainercloud.com"
+            echo "   - Path: (leave empty)"
+            echo "   - Service: http://public-gateway-nginx.nginx-gateway.svc.cluster.local:80"
+            exit 1
+          fi
+          
+          # Create secret with tunnel token
+          kubectl create secret generic cloudflared-tunnel-token \
+            --from-literal=token="$CLOUDFLARE_TUNNEL_TOKEN" \
+            --namespace nginx-gateway \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy cloudflared using manifest (Helm chart doesn't support token-based tunnels)
+          kubectl apply -f k8s/gateway/cloudflared-deployment.yaml
+          
+          echo "⏳ Waiting for Cloudflare Tunnel to be ready..."
+          kubectl rollout status deployment/cloudflared -n nginx-gateway --timeout=3m
+          
+          echo "✅ Cloudflare Tunnel deployed!"
+
+      - name: Configure NginxProxy for ClusterIP (CloudflareTunnel mode)
+        if: ${{ inputs.action == 'install' && inputs.service_mode == 'CloudflareTunnel' }}
+        run: |
+          set -euo pipefail
+          echo "📜 Configuring NginxProxy for ClusterIP service type..."
+          
+          # Apply the NginxProxy resource that sets service type to ClusterIP
+          kubectl apply -f k8s/gateway/nginx-proxy-clusterip.yaml
+          
+          # Patch the GatewayClass to reference the NginxProxy
+          echo "Patching GatewayClass 'nginx' to use NginxProxy..."
+          kubectl patch gatewayclass nginx --type=merge -p '{
+            "spec": {
+              "parametersRef": {
+                "group": "gateway.nginx.org",
+                "kind": "NginxProxy",
+                "name": "ngf-proxy-clusterip",
+                "namespace": "nginx-gateway"
+              }
+            }
+          }'
+          
+          # Delete existing data plane service so it recreates as ClusterIP
+          echo "Deleting data plane service so it recreates as ClusterIP..."
+          kubectl delete svc public-gateway-nginx -n nginx-gateway --ignore-not-found=true || true
+          
+          # Verify configuration
+          echo "Verifying GatewayClass parametersRef:"
+          kubectl get gatewayclass nginx -o jsonpath='{.spec.parametersRef.kind}{" "}{.spec.parametersRef.name}{"\n"}' || true
+          
+          echo "Verifying data plane service type (may take a few seconds to recreate):"
+          for i in {1..30}; do
+            t=$(kubectl get svc public-gateway-nginx -n nginx-gateway -o jsonpath='{.spec.type}' 2>/dev/null || true)
+            if [ -n "$t" ]; then echo "public-gateway-nginx type=$t"; break; fi
+            sleep 2
+          done
+          
+          echo "✅ NginxProxy configured - data plane services will be ClusterIP"
+          kubectl get nginxproxy -n nginx-gateway
+
+      - name: Apply shared Gateway
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          echo "📜 Applying shared Gateway..."
+
+          kubectl apply -f k8s/gateway/gateway.yaml
+
+          echo
+          echo "Current GatewayClasses:"
+          kubectl get gatewayclasses.gateway.networking.k8s.io
+
+          echo
+          echo "Current Gateways:"
+          kubectl get gateways.gateway.networking.k8s.io -A
+
+      - name: Wait for Gateway external IP (LoadBalancer mode)
+        if: ${{ inputs.action == 'install' && inputs.service_mode == 'LoadBalancer' }}
+        run: |
+          set -euo pipefail
+
+          GATEWAY_NAME="public-gateway"
+          GATEWAY_NS="nginx-gateway"
+
+          echo "⏳ Waiting for Gateway $GATEWAY_NS/$GATEWAY_NAME to get an external IP..."
+
+          for i in {1..60}; do
+            ip=$(kubectl get gateway "$GATEWAY_NAME" -n "$GATEWAY_NS" -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || echo "")
+            if [ -n "$ip" ] && [ "$ip" != "null" ]; then
+              echo ""
+              echo "✅ Gateway is ready (LoadBalancer mode)!"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "EXTERNAL-IP: $ip"
+              echo "Test HTTPS:  https://$ip"
+              echo "Or via DNS:  https://rainercloud.com (once A record is set)"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              exit 0
+            fi
+            echo "Waiting for EXTERNAL-IP... (attempt $i/60)"
+            sleep 10
+          done
+
+          echo "⚠️ Timed out waiting for Gateway external IP"
+          kubectl get gateway "$GATEWAY_NAME" -n "$GATEWAY_NS" -o yaml || true
+          exit 1
+
+      - name: Display Cloudflare Tunnel status
+        if: ${{ inputs.action == 'install' && inputs.service_mode == 'CloudflareTunnel' }}
+        run: |
+          set -euo pipefail
+          
+          echo ""
+          echo "✅ NGINX Gateway Fabric deployed with Cloudflare Tunnel!"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🚇 CLOUDFLARE TUNNEL STATUS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Cloudflared pods:"
+          kubectl get pods -n nginx-gateway -l app=cloudflared
+          echo ""
+          echo "Cloudflared logs (last 20 lines):"
+          kubectl logs -n nginx-gateway -l app=cloudflared --tail=20 || true
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🌐 ACCESS YOUR SITE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Your site should now be accessible at: https://rainercloud.com"
+          echo ""
+          echo "If not working, check:"
+          echo "1. Cloudflare Dashboard → Zero Trust → Tunnels"
+          echo "   - Ensure tunnel status is 'Healthy'"
+          echo ""
+          echo "2. Tunnel's Public Hostname is configured:"
+          echo "   - Domain: rainercloud.com"
+          echo "   - Service: http://public-gateway-nginx.nginx-gateway.svc.cluster.local:80"
+          echo ""
+          echo "3. Cloudflare DNS has a CNAME record:"
+          echo "   - Name: rainercloud.com (or @)"
+          echo "   - Target: <tunnel-id>.cfargotunnel.com"
+          echo "   - Proxy: Enabled (orange cloud)"
+          echo ""
+
+      # ===================== UNINSTALL PATH =====================
+      - name: Delete Cloudflare Tunnel components
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "🧹 Deleting Cloudflare Tunnel components (if present)..."
+          
+          # Clean up manifest-based deployment
+          kubectl delete -f k8s/gateway/cloudflared-deployment.yaml --ignore-not-found=true || true
+          kubectl delete secret cloudflared-tunnel-token -n nginx-gateway --ignore-not-found=true || true
+          
+          # Clean up any Helm-based deployment (from previous attempts)
+          helm uninstall cloudflared -n nginx-gateway 2>/dev/null || true
+          kubectl delete secret cloudflared-cloudflare-tunnel -n nginx-gateway --ignore-not-found=true || true
+
+      - name: Delete shared Gateway, Certificate, and NginxProxy
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "🧹 Deleting shared Gateway, Certificate, and NginxProxy (if present)..."
+
+          kubectl delete -f k8s/gateway/gateway.yaml --ignore-not-found=true || true
+          kubectl delete -f k8s/gateway/rainercloud-certificate.yaml --ignore-not-found=true || true
+          kubectl delete -f k8s/gateway/nginx-proxy-clusterip.yaml --ignore-not-found=true || true
+          
+          # Remove parametersRef from GatewayClass if it exists
+          kubectl patch gatewayclass nginx --type=json \
+            -p='[{"op": "remove", "path": "/spec/parametersRef"}]' 2>/dev/null || true
+
+      - name: Uninstall NGINX Gateway Fabric
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          echo "🧹 Uninstalling NGINX Gateway Fabric Helm release..."
+          helm uninstall nginx-gateway -n nginx-gateway || echo "Helm release not found, may already be uninstalled"
+
+          echo "Deleting nginx-gateway namespace..."
+          kubectl delete namespace nginx-gateway --ignore-not-found=true || true
+
+          echo "✅ NGINX Gateway Fabric uninstalled"

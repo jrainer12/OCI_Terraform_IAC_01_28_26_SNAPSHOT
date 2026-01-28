@@ -1,0 +1,115 @@
+name: Update-Cloudflare-IPs
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # daily at 7am UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_COMPARTMENT_OCID }}
+
+jobs:
+  update-and-apply:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout IaC repo
+        uses: actions/checkout@v4
+
+      - name: Fetch Cloudflare IPv4 list
+        run: |
+          set -euo pipefail
+          curl -s https://www.cloudflare.com/ips-v4 > cf_ipv4.txt
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Update Terraform Cloudflare locals
+        id: update_tf
+        run: |
+          set -euo pipefail
+          python3 scripts/update_cloudflare_ips.py
+
+          # Detect if anything actually changed in the repo
+          git add -N .
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No Cloudflare CIDR changes detected."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Cloudflare CIDR changes detected."
+          fi
+
+      - name: Commit and push updated CIDRs
+        if: steps.update_tf.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Auto-update Cloudflare IPv4 CIDRs"
+          git push
+          echo "✓ Committed updated Cloudflare CIDRs"
+
+      - name: Setup Terraform
+        if: steps.update_tf.outputs.changed == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+          terraform_wrapper: false
+
+      - name: Write OCI config
+        if: steps.update_tf.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_PRIVATE_KEY_BASE64 }}" | base64 -d > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<'EOF'
+          [DEFAULT]
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          key_file=~/.oci/oci_api_key.pem
+          region=${{ secrets.OCI_REGION }}
+          EOF
+
+      - name: Terraform init
+        if: steps.update_tf.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cat > backend-config.hcl <<BACKEND_EOF
+          bucket                      = "terraform-state"
+          key                         = "oci-oke/terraform.tfstate"
+          region                      = "${{ secrets.OCI_REGION }}"
+          endpoint                    = "https://${{ secrets.OCI_OBJECT_STORAGE_NAMESPACE }}.compat.objectstorage.${{ secrets.OCI_REGION }}.oraclecloud.com"
+          access_key                  = "${{ secrets.OCI_S3_ACCESS_KEY_ID }}"
+          secret_key                  = "${{ secrets.OCI_S3_SECRET_ACCESS_KEY }}"
+          skip_credentials_validation = true
+          skip_region_validation       = true
+          skip_metadata_api_check      = true
+          force_path_style             = true
+          BACKEND_EOF
+
+          terraform init -no-color -input=false -backend-config=backend-config.hcl
+          rm -f backend-config.hcl
+
+      - name: Terraform plan
+        if: steps.update_tf.outputs.changed == 'true'
+        run: terraform plan -no-color -input=false -out=tfplan
+
+      - name: Terraform apply (skip node pool)
+        if: steps.update_tf.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          echo "TF_VAR_create_node_pool=false" >> "$GITHUB_ENV"
+          terraform apply -no-color -input=false -auto-approve tfplan

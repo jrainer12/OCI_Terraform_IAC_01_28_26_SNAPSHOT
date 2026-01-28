@@ -1,0 +1,135 @@
+name: Deploy Nginx Ingress (Depreciated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: install or uninstall nginx
+        required: true
+        default: install
+        type: choice
+        options: [install, uninstall]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-nginx
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_compartment_ocid: ${{ secrets.TF_VAR_COMPARTMENT_OCID }}
+
+jobs:
+  deploy-nginx:
+    runs-on: ubuntu-latest
+    env:
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_PRIVATE_KEY_BASE64: ${{ secrets.OCI_PRIVATE_KEY_BASE64 }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_OBJECT_STORAGE_NAMESPACE: ${{ secrets.OCI_OBJECT_STORAGE_NAMESPACE }}
+      OCI_S3_ACCESS_KEY_ID: ${{ secrets.OCI_S3_ACCESS_KEY_ID }}
+      OCI_S3_SECRET_ACCESS_KEY: ${{ secrets.OCI_S3_SECRET_ACCESS_KEY }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout IaC repo
+        uses: actions/checkout@v4
+
+      - name: Terraform init & get cluster id
+        id: tf
+        uses: jrainer12/Reusable_GitHub_Actions/.github/actions/oci-terraform-init-oke@main
+        with:
+          backend_key: "oci-oke/terraform.tfstate"
+          terraform_version: "1.5.7"
+
+      - name: Validate cluster_id
+        if: ${{ inputs.action == 'install' || inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          cid="${{ steps.tf.outputs.cluster_id }}"
+          if [ -z "$cid" ]; then
+            echo "❌ Error: cluster_id is empty from terraform output"
+            echo "Make sure the cluster has been deployed first using the main pipeline"
+            exit 1
+          fi
+          echo "Using cluster_id=$cid"
+
+      - name: Setup OCI / OKE / kubectl / Helm
+        uses: jrainer12/Reusable_GitHub_Actions/.github/actions/oci-oke-setup@main
+        with:
+          cluster_ocid: ${{ steps.tf.outputs.cluster_id }}
+
+      # ===================== INSTALL PATH =====================
+      - name: Install ingress-nginx (NLB)
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          
+          echo "Adding ingress-nginx Helm repo..."
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+          
+          echo "Installing ingress-nginx with NLB annotation and snippet support..."
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx --create-namespace \
+            --set "controller.service.annotations.oci\.oraclecloud\.com/load-balancer-type=nlb" \
+            --set "controller.allowSnippetAnnotations=true" \
+            --set "controller.config.enable-access-log=true"
+          
+          echo "Waiting for ingress-nginx controller to be ready..."
+          kubectl rollout status deploy/ingress-nginx-controller -n ingress-nginx --timeout=10m
+
+      - name: Re-apply Terraform for security rules
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          echo "Re-running terraform apply to ensure load balancer security rules are correct..."
+          terraform plan -no-color -input=false -out=tfplan-security || true
+          terraform apply -no-color -input=false -auto-approve tfplan-security || echo "No changes needed for security rules"
+
+      - name: Wait for ingress EXTERNAL-IP and display
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for ingress controller to get EXTERNAL-IP..."
+          
+          for i in {1..60}; do
+            ip=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            if [ -n "$ip" ] && [ "$ip" != "null" ]; then
+              echo ""
+              echo "✅ Ingress controller is ready!"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "EXTERNAL-IP: $ip"
+              echo "Test it: http://$ip"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              kubectl get svc -n ingress-nginx ingress-nginx-controller -o wide
+              exit 0
+            fi
+            echo "Waiting for EXTERNAL-IP... (attempt $i/60)"
+            sleep 10
+          done
+          
+          echo "⚠️  Timed out waiting for EXTERNAL-IP"
+          echo "Service status:"
+          kubectl get svc -n ingress-nginx ingress-nginx-controller -o wide
+          exit 1
+
+      # ===================== UNINSTALL PATH =====================
+      - name: Uninstall ingress-nginx
+        if: ${{ inputs.action == 'uninstall' }}
+        run: |
+          set -euo pipefail
+          
+          echo "Uninstalling ingress-nginx..."
+          helm uninstall ingress-nginx -n ingress-nginx || echo "Helm release not found, may already be uninstalled"
+          
+          kubectl delete namespace ingress-nginx --ignore-not-found=true || true
+          
+          echo "✅ ingress-nginx uninstalled"
