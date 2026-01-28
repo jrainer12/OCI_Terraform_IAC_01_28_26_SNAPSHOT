@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-alerting-rules
+  namespace: monitoring
+  labels:
+    grafana_alert: "1"
+data:
+  notification-policies.yaml: |
+    apiVersion: 1
+    policies:
+      - orgId: 1
+        receiver: Josef
+        group_by:
+          - alertname
+          - node
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+  alert-rules.yaml: |
+    apiVersion: 1
+    groups:
+      - orgId: 1
+        name: node-health
+        folder: Kubernetes
+        interval: 1m
+        rules:
+          - uid: node_not_ready
+            title: Node Not Ready
+            condition: B
+            data:
+              - refId: A
+                datasourceUid: prometheus
+                relativeTimeRange:
+                  from: 300
+                  to: 0
+                model:
+                  datasource:
+                    type: prometheus
+                    uid: prometheus
+                  editorMode: code
+                  expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+                  instant: true
+                  intervalMs: 1000
+                  legendFormat: "{{node}}"
+                  maxDataPoints: 43200
+                  refId: A
+              - refId: B
+                datasourceUid: __expr__
+                relativeTimeRange:
+                  from: 300
+                  to: 0
+                model:
+                  conditions:
+                    - evaluator:
+                        params:
+                          - 0
+                        type: gt
+                      operator:
+                        type: and
+                      query:
+                        params:
+                          - A
+                      reducer:
+                        type: last
+                      type: query
+                  datasource:
+                    type: __expr__
+                    uid: __expr__
+                  expression: A
+                  intervalMs: 1000
+                  maxDataPoints: 43200
+                  refId: B
+                  type: classic_conditions
+            for: 5m
+            noDataState: NoData
+            execErrState: Error
+            annotations:
+              summary: Node not ready
+              description: Node {{ $labels.node }} is not Ready for more than 5 minutes.
+            labels:
+              team: infra
+              severity: warning
+          - uid: node_unschedulable
+            title: Node Unschedulable
+            condition: B
+            data:
+              - refId: A
+                datasourceUid: prometheus
+                relativeTimeRange:
+                  from: 300
+                  to: 0
+                model:
+                  datasource:
+                    type: prometheus
+                    uid: prometheus
+                  editorMode: code
+                  expr: kube_node_spec_unschedulable == 1
+                  instant: true
+                  intervalMs: 1000
+                  legendFormat: "{{node}}"
+                  maxDataPoints: 43200
+                  refId: A
+              - refId: B
+                datasourceUid: __expr__
+                relativeTimeRange:
+                  from: 300
+                  to: 0
+                model:
+                  conditions:
+                    - evaluator:
+                        params:
+                          - 0
+                        type: gt
+                      operator:
+                        type: and
+                      query:
+                        params:
+                          - A
+                      reducer:
+                        type: last
+                      type: query
+                  datasource:
+                    type: __expr__
+                    uid: __expr__
+                  expression: A
+                  intervalMs: 1000
+                  maxDataPoints: 43200
+                  refId: B
+                  type: classic_conditions
+            for: 10m
+            noDataState: NoData
+            execErrState: Error
+            annotations:
+              summary: Node unschedulable
+              description: Node {{ $labels.node }} is unschedulable for more than 10 minutes.
+            labels:
+              team: infra
+              severity: warning

@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: rainercloud-com
+  namespace: nginx-gateway
+spec:
+  secretName: rainercloud-com-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-cloudflare
+  dnsNames:
+    - rainercloud.com

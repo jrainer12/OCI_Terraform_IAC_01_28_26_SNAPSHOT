@@ -1,0 +1,10 @@
+apiVersion: gateway.nginx.org/v1alpha2
+kind: NginxProxy
+metadata:
+  name: ngf-proxy-clusterip
+  namespace: nginx-gateway
+spec:
+  kubernetes:
+    service:
+      type: ClusterIP
+

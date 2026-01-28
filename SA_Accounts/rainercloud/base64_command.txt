@@ -1,0 +1,1 @@
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("config")) | Out-File -Encoding ascii kubeconfig.b64

@@ -1,0 +1,223 @@
+{
+  "info": {
+    "name": "Grafana API",
+    "description": "Grafana API collection for managing datasources, dashboards, and alerting",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "basic",
+    "basic": [
+      {
+        "key": "username",
+        "value": "{{grafana_user}}",
+        "type": "string"
+      },
+      {
+        "key": "password",
+        "value": "{{grafana_password}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "grafana_url",
+      "value": "https://rainercloud.com/grafana",
+      "type": "string"
+    },
+    {
+      "key": "grafana_user",
+      "value": "admin",
+      "type": "string"
+    },
+    {
+      "key": "grafana_password",
+      "value": "YOUR_PASSWORD_HERE",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/health"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Provisioning",
+      "item": [
+        {
+          "name": "Reload Datasources",
+          "request": {
+            "method": "POST",
+            "url": "{{grafana_url}}/api/admin/provisioning/datasources/reload"
+          }
+        },
+        {
+          "name": "Reload Dashboards",
+          "request": {
+            "method": "POST",
+            "url": "{{grafana_url}}/api/admin/provisioning/dashboards/reload"
+          }
+        },
+        {
+          "name": "Reload Alerting",
+          "request": {
+            "method": "POST",
+            "url": "{{grafana_url}}/api/admin/provisioning/alerting/reload"
+          }
+        },
+        {
+          "name": "Reload Notifications",
+          "request": {
+            "method": "POST",
+            "url": "{{grafana_url}}/api/admin/provisioning/notifications/reload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Datasources",
+      "item": [
+        {
+          "name": "List All Datasources",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/datasources"
+          }
+        },
+        {
+          "name": "Get Datasource by ID",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/datasources/1"
+          }
+        },
+        {
+          "name": "Get Datasource by Name",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/datasources/name/Prometheus"
+          }
+        },
+        {
+          "name": "Test Datasource",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/datasources/1/health"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Dashboards",
+      "item": [
+        {
+          "name": "Search Dashboards",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{grafana_url}}/api/search?type=dash-db",
+              "host": ["{{grafana_url}}"],
+              "path": ["api", "search"],
+              "query": [
+                {
+                  "key": "type",
+                  "value": "dash-db"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Dashboard by UID",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/dashboards/uid/YOUR_DASHBOARD_UID"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Alerting",
+      "item": [
+        {
+          "name": "List Alert Rules",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/v1/provisioning/alert-rules"
+          }
+        },
+        {
+          "name": "List Contact Points",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/v1/provisioning/contact-points"
+          }
+        },
+        {
+          "name": "Test Contact Point",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"receivers\": [\n    {\n      \"name\": \"Josef\",\n      \"grafana_managed_receiver_configs\": [\n        {\n          \"name\": \"telegram-josef\",\n          \"type\": \"telegram\",\n          \"settings\": {}\n        }\n      ]\n    }\n  ]\n}"
+            },
+            "url": "{{grafana_url}}/api/alertmanager/grafana/config/api/v1/receivers/test"
+          }
+        },
+        {
+          "name": "List Notification Policies",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/v1/provisioning/policies"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "Get Current User",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/user"
+          }
+        },
+        {
+          "name": "List Users",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/users"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Organization",
+      "item": [
+        {
+          "name": "Get Current Org",
+          "request": {
+            "method": "GET",
+            "url": "{{grafana_url}}/api/org"
+          }
+        }
+      ]
+    }
+  ]
+}
+

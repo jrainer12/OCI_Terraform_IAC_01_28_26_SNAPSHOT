@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-alerting-contactpoints
+  namespace: monitoring
+  labels:
+    grafana_alert: "1"
+data:
+  contactpoints.yaml: |
+    apiVersion: 1
+    contactPoints:
+      - orgId: 1
+        name: Josef
+        receivers:
+          - uid: telegram-josef
+            type: telegram
+            settings:
+              bottoken: ${TELEGRAM_BOT_TOKEN}
+              chatid: "TELEGRAM_CHAT_ID_PLACEHOLDER"
+            disableResolveMessage: false
